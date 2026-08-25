@@ -1,196 +1,312 @@
-"""Local JSON-based persistence for the sender profile and document history."""
+"""Supabase-backed persistence for the sender profile and document history.
+
+Function names and signatures intentionally mirror the earlier local-JSON
+implementation so app.py did not need to change. Two Supabase pieces are
+used: Postgres tables for structured records, and two Storage buckets
+("assets" for the logo/signature, "documents" for generated PDFs).
+"""
 
 from __future__ import annotations
 
 import base64
 import io
 import json
+import os
 import uuid
 import zipfile
-from pathlib import Path
+from functools import lru_cache
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DOCS_DIR = DATA_DIR / "documents"
-PROFILE_PATH = DATA_DIR / "profile.json"
-HISTORY_PATH = DATA_DIR / "history.json"
-CLIENTS_PATH = DATA_DIR / "clients.json"
-ITEM_TEMPLATES_PATH = DATA_DIR / "item_templates.json"
-RECURRING_PATH = DATA_DIR / "recurring_templates.json"
-COUNTERS_PATH = DATA_DIR / "counters.json"
+from supabase import create_client, Client
+
+ASSETS_BUCKET = "assets"
+DOCUMENTS_BUCKET = "documents"
 
 
-def _ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+@lru_cache(maxsize=1)
+def _get_client() -> Client:
+    """Build the Supabase client from Streamlit secrets, or env vars as a fallback."""
+    url = key = None
+    try:
+        import streamlit as st
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        pass
+    url = url or os.environ.get("SUPABASE_URL")
+    key = key or os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "Supabase credentials not found. Set SUPABASE_URL and SUPABASE_KEY in "
+            ".streamlit/secrets.toml (local) or the app's Secrets settings (Streamlit Cloud)."
+        )
+    return create_client(url, key)
 
 
-_BINARY_FIELDS = ["logo_bytes", "signature_bytes"]
+def _guess_ext(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    return "bin"
 
 
+def _content_type_for(ext: str) -> str:
+    return {"png": "image/png", "jpg": "image/jpeg"}.get(ext, "application/octet-stream")
+
+
+def _upload_asset(base_path: str, data: bytes) -> str:
+    client = _get_client()
+    ext = _guess_ext(data)
+    full_path = f"{base_path}.{ext}"
+    client.storage.from_(ASSETS_BUCKET).upload(
+        full_path, data, {"content-type": _content_type_for(ext), "upsert": "true"},
+    )
+    return full_path
+
+
+def _download_asset(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    try:
+        return _get_client().storage.from_(ASSETS_BUCKET).download(path)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- Profile --
 def save_profile(profile: dict) -> None:
-    """Persist sender/company details (logo/signature images, base64-encoded) to disk."""
-    _ensure_dirs()
-    payload = dict(profile)
-    for field_name in _BINARY_FIELDS:
-        raw = payload.pop(field_name, None)
-        payload[f"{field_name}_b64"] = base64.b64encode(raw).decode("ascii") if raw else None
-    PROFILE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Persist sender/company details (logo/signature uploaded to Storage)."""
+    client = _get_client()
+    row = {
+        "id": 1,
+        "name": profile.get("name", ""),
+        "email": profile.get("email", ""),
+        "address": profile.get("address", ""),
+        "tax_number": profile.get("tax_number", ""),
+    }
+    logo_bytes = profile.get("logo_bytes")
+    signature_bytes = profile.get("signature_bytes")
+    if logo_bytes:
+        row["logo_path"] = _upload_asset("profile/logo", logo_bytes)
+    if signature_bytes:
+        row["signature_path"] = _upload_asset("profile/signature", signature_bytes)
+    client.table("profile").upsert(row).execute()
 
 
 def load_profile() -> dict | None:
-    """Load a previously saved sender profile, or None if none exists."""
-    if not PROFILE_PATH.exists():
+    """Load the saved sender profile, or None if none has been saved yet."""
+    res = _get_client().table("profile").select("*").eq("id", 1).limit(1).execute()
+    if not res.data:
         return None
-    payload = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    for field_name in _BINARY_FIELDS:
-        b64 = payload.pop(f"{field_name}_b64", None)
-        payload[field_name] = base64.b64decode(b64) if b64 else None
-    return payload
+    row = res.data[0]
+    return {
+        "name": row.get("name", ""),
+        "email": row.get("email", ""),
+        "address": row.get("address", ""),
+        "tax_number": row.get("tax_number", ""),
+        "logo_bytes": _download_asset(row.get("logo_path")),
+        "signature_bytes": _download_asset(row.get("signature_path")),
+    }
 
 
 def clear_profile() -> None:
-    if PROFILE_PATH.exists():
-        PROFILE_PATH.unlink()
+    _get_client().table("profile").delete().eq("id", 1).execute()
 
 
-def _load_history_index() -> list[dict]:
-    if not HISTORY_PATH.exists():
-        return []
-    return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-
-
-def _save_history_index(records: list[dict]) -> None:
-    HISTORY_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
+# --------------------------------------------------------- Document history --
 def save_document(pdf_bytes: bytes, metadata: dict) -> str:
-    """Save a generated PDF and its metadata; return the new record id."""
-    _ensure_dirs()
-    doc_id = uuid.uuid4().hex[:12]
-    file_path = DOCS_DIR / f"{doc_id}.pdf"
-    file_path.write_bytes(pdf_bytes)
-
-    records = _load_history_index()
-    record = {"id": doc_id, "file": file_path.name, **metadata}
-    records.insert(0, record)
-    _save_history_index(records)
+    """Save a generated PDF (to Storage) and its metadata (to Postgres); return its id."""
+    client = _get_client()
+    doc_id = uuid.uuid4().hex
+    pdf_path = f"{doc_id}.pdf"
+    client.storage.from_(DOCUMENTS_BUCKET).upload(
+        pdf_path, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"},
+    )
+    row = {
+        "id": doc_id,
+        "doc_type": metadata["doc_type"],
+        "doc_number": metadata["doc_number"],
+        "client_name": metadata.get("client_name", ""),
+        "grand_total": metadata.get("grand_total", 0),
+        "balance_due": metadata.get("balance_due", 0),
+        "currency": metadata.get("currency", "₺"),
+        "issue_date": metadata.get("issue_date", ""),
+        "due_date_iso": metadata.get("due_date_iso"),
+        "file_name": metadata.get("file_name", ""),
+        "status": metadata.get("status", "unpaid"),
+        "pdf_path": pdf_path,
+    }
+    if metadata.get("created_at"):
+        row["created_at"] = metadata["created_at"]
+    client.table("documents").insert(row).execute()
     return doc_id
+
+
+def _normalize_created_at(value) -> str:
+    """Render a Postgres timestamp back into the app's 'YYYY-MM-DD HH:MM' display format."""
+    text = str(value or "")
+    return text.replace("T", " ")[:16]
 
 
 def list_documents() -> list[dict]:
     """Return saved document metadata, most recent first."""
-    return _load_history_index()
+    res = _get_client().table("documents").select("*").order("created_at", desc=True).execute()
+    records = []
+    for row in res.data:
+        records.append({
+            "id": row["id"],
+            "doc_type": row.get("doc_type", ""),
+            "doc_number": row.get("doc_number", ""),
+            "client_name": row.get("client_name", ""),
+            "grand_total": float(row.get("grand_total") or 0),
+            "balance_due": float(row.get("balance_due") or 0),
+            "currency": row.get("currency", "₺"),
+            "issue_date": row.get("issue_date", ""),
+            "due_date_iso": row.get("due_date_iso"),
+            "created_at": _normalize_created_at(row.get("created_at")),
+            "file_name": row.get("file_name", ""),
+            "status": row.get("status", "unpaid"),
+        })
+    return records
 
 
 def read_document(doc_id: str) -> bytes | None:
-    path = DOCS_DIR / f"{doc_id}.pdf"
-    return path.read_bytes() if path.exists() else None
+    try:
+        return _get_client().storage.from_(DOCUMENTS_BUCKET).download(f"{doc_id}.pdf")
+    except Exception:
+        return None
 
 
 def delete_document(doc_id: str) -> None:
-    records = _load_history_index()
-    records = [r for r in records if r["id"] != doc_id]
-    _save_history_index(records)
-    path = DOCS_DIR / f"{doc_id}.pdf"
-    if path.exists():
-        path.unlink()
+    client = _get_client()
+    client.table("documents").delete().eq("id", doc_id).execute()
+    try:
+        client.storage.from_(DOCUMENTS_BUCKET).remove([f"{doc_id}.pdf"])
+    except Exception:
+        pass
 
 
 def update_document_status(doc_id: str, status: str) -> None:
     """Set the payment status ('unpaid', 'paid') on a saved document record."""
-    records = _load_history_index()
-    for r in records:
-        if r["id"] == doc_id:
-            r["status"] = status
-            break
-    _save_history_index(records)
+    _get_client().table("documents").update({"status": status}).eq("id", doc_id).execute()
 
 
 # ---------------------------------------------------------- Address book --
-def _load_clients() -> list[dict]:
-    if not CLIENTS_PATH.exists():
-        return []
-    return json.loads(CLIENTS_PATH.read_text(encoding="utf-8"))
-
-
-def _save_clients(records: list[dict]) -> None:
-    _ensure_dirs()
-    CLIENTS_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def save_client(client: dict) -> str:
+def save_client(client_data: dict) -> str:
     """Save or update a client in the address book (matched by name+email); return its id."""
-    records = _load_clients()
-    key = (client.get("name", "").strip().lower(), client.get("email", "").strip().lower())
-    for r in records:
-        if (r.get("name", "").strip().lower(), r.get("email", "").strip().lower()) == key:
-            r.update(client)
-            _save_clients(records)
-            return r["id"]
+    client = _get_client()
+    name = client_data.get("name", "").strip()
+    email = client_data.get("email", "").strip()
+    key = (name.lower(), email.lower())
 
-    client_id = uuid.uuid4().hex[:12]
-    record = {"id": client_id, **client}
-    records.append(record)
-    _save_clients(records)
-    return client_id
+    existing = client.table("clients").select("*").execute().data
+    for row in existing:
+        if (row.get("name", "").strip().lower(), row.get("email", "").strip().lower()) == key:
+            client.table("clients").update({
+                "name": name, "company": client_data.get("company", "").strip(),
+                "email": email, "address": client_data.get("address", "").strip(),
+            }).eq("id", row["id"]).execute()
+            return row["id"]
+
+    res = client.table("clients").insert({
+        "name": name, "company": client_data.get("company", "").strip(),
+        "email": email, "address": client_data.get("address", "").strip(),
+    }).execute()
+    return res.data[0]["id"]
 
 
 def list_clients() -> list[dict]:
     """Return saved clients, alphabetically by name."""
-    return sorted(_load_clients(), key=lambda r: r.get("name", "").lower())
+    res = _get_client().table("clients").select("*").order("name").execute()
+    return res.data
 
 
 def delete_client(client_id: str) -> None:
-    records = [r for r in _load_clients() if r["id"] != client_id]
-    _save_clients(records)
+    _get_client().table("clients").delete().eq("id", client_id).execute()
 
 
 # ------------------------------------------------------- Item templates ---
-def _load_item_templates() -> list[dict]:
-    if not ITEM_TEMPLATES_PATH.exists():
-        return []
-    return json.loads(ITEM_TEMPLATES_PATH.read_text(encoding="utf-8"))
-
-
-def _save_item_templates(records: list[dict]) -> None:
-    _ensure_dirs()
-    ITEM_TEMPLATES_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def save_item_template(template: dict) -> str:
     """Save a reusable line-item template (description, quantity, unit_price)."""
-    records = _load_item_templates()
-    template_id = uuid.uuid4().hex[:12]
-    record = {"id": template_id, **template}
-    records.append(record)
-    _save_item_templates(records)
-    return template_id
+    res = _get_client().table("item_templates").insert({
+        "description": template.get("description", ""),
+        "quantity": template.get("quantity", 1),
+        "unit_price": template.get("unit_price", 0),
+    }).execute()
+    return res.data[0]["id"]
 
 
 def list_item_templates() -> list[dict]:
     """Return saved item templates, alphabetically by description."""
-    return sorted(_load_item_templates(), key=lambda r: r.get("description", "").lower())
+    res = _get_client().table("item_templates").select("*").order("description").execute()
+    return res.data
 
 
 def delete_item_template(template_id: str) -> None:
-    records = [r for r in _load_item_templates() if r["id"] != template_id]
-    _save_item_templates(records)
+    _get_client().table("item_templates").delete().eq("id", template_id).execute()
+
+
+# --------------------------------------------------- Recurring templates --
+def save_recurring_template(template: dict) -> str:
+    """Save a full invoice preset (client, items, tax, notes) for reuse each period."""
+    row = dict(template)
+    row.setdefault("items", [])
+    res = _get_client().table("recurring_templates").insert(row).execute()
+    return res.data[0]["id"]
+
+
+def list_recurring_templates() -> list[dict]:
+    """Return saved recurring templates, alphabetically by name."""
+    res = _get_client().table("recurring_templates").select("*").order("name").execute()
+    return res.data
+
+
+def delete_recurring_template(template_id: str) -> None:
+    _get_client().table("recurring_templates").delete().eq("id", template_id).execute()
+
+
+# ---------------------------------------------------- Document numbering --
+def _get_counter(doc_type: str) -> int:
+    res = _get_client().table("counters").select("value").eq("doc_type", doc_type).execute()
+    return res.data[0]["value"] if res.data else 0
+
+
+def peek_next_number(doc_type: str) -> int:
+    """Return the sequence number that would be suggested next, without consuming it."""
+    return _get_counter(doc_type) + 1
+
+
+def consume_next_number(doc_type: str) -> int:
+    """Advance and persist the counter for doc_type; return the number just consumed."""
+    next_n = _get_counter(doc_type) + 1
+    _get_client().table("counters").upsert({"doc_type": doc_type, "value": next_n}).execute()
+    return next_n
 
 
 # ------------------------------------------------------------- Export all --
 def export_all_zip() -> bytes:
-    """Bundle every saved PDF plus the profile/history/clients JSON into one ZIP."""
-    _ensure_dirs()
+    """Bundle every saved PDF plus the profile/history/clients data into one ZIP."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for json_path in [PROFILE_PATH, HISTORY_PATH, CLIENTS_PATH, ITEM_TEMPLATES_PATH, RECURRING_PATH, COUNTERS_PATH]:
-            if json_path.exists():
-                zf.write(json_path, arcname=json_path.name)
-        for pdf_path in DOCS_DIR.glob("*.pdf"):
-            zf.write(pdf_path, arcname=f"documents/{pdf_path.name}")
+        profile = load_profile()
+        if profile:
+            payload = {
+                "name": profile.get("name", ""), "email": profile.get("email", ""),
+                "address": profile.get("address", ""), "tax_number": profile.get("tax_number", ""),
+            }
+            logo_bytes = profile.get("logo_bytes")
+            signature_bytes = profile.get("signature_bytes")
+            payload["logo_bytes_b64"] = base64.b64encode(logo_bytes).decode("ascii") if logo_bytes else None
+            payload["signature_bytes_b64"] = base64.b64encode(signature_bytes).decode("ascii") if signature_bytes else None
+            zf.writestr("profile.json", json.dumps(payload, ensure_ascii=False, indent=2))
 
-        history = _load_history_index()
+        history = list_documents()
         if history:
+            zf.writestr("history.json", json.dumps(history, ensure_ascii=False, indent=2, default=str))
+            for rec in history:
+                pdf_bytes = read_document(rec["id"])
+                if pdf_bytes:
+                    zf.writestr(f"documents/{rec['id']}.pdf", pdf_bytes)
             csv_lines = ["id,doc_type,doc_number,client_name,grand_total,currency,issue_date,created_at,file_name"]
             for r in history:
                 csv_lines.append(",".join(str(r.get(k, "")).replace(",", ";") for k in [
@@ -199,77 +315,34 @@ def export_all_zip() -> bytes:
                 ]))
             zf.writestr("history_summary.csv", "\n".join(csv_lines))
 
+        clients = list_clients()
+        if clients:
+            zf.writestr("clients.json", json.dumps(clients, ensure_ascii=False, indent=2, default=str))
+
+        templates = list_item_templates()
+        if templates:
+            zf.writestr("item_templates.json", json.dumps(templates, ensure_ascii=False, indent=2, default=str))
+
+        recurring = list_recurring_templates()
+        if recurring:
+            zf.writestr("recurring_templates.json", json.dumps(recurring, ensure_ascii=False, indent=2, default=str))
+
+        counters_rows = _get_client().table("counters").select("*").execute().data
+        if counters_rows:
+            counters_dict = {r["doc_type"]: r["value"] for r in counters_rows}
+            zf.writestr("counters.json", json.dumps(counters_dict, ensure_ascii=False, indent=2))
+
     return buffer.getvalue()
-
-
-# --------------------------------------------------- Recurring templates --
-def _load_recurring() -> list[dict]:
-    if not RECURRING_PATH.exists():
-        return []
-    return json.loads(RECURRING_PATH.read_text(encoding="utf-8"))
-
-
-def _save_recurring(records: list[dict]) -> None:
-    _ensure_dirs()
-    RECURRING_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def save_recurring_template(template: dict) -> str:
-    """Save a full invoice preset (client, items, tax, notes) for reuse each period."""
-    records = _load_recurring()
-    template_id = uuid.uuid4().hex[:12]
-    record = {"id": template_id, **template}
-    records.append(record)
-    _save_recurring(records)
-    return template_id
-
-
-def list_recurring_templates() -> list[dict]:
-    """Return saved recurring templates, alphabetically by name."""
-    return sorted(_load_recurring(), key=lambda r: r.get("name", "").lower())
-
-
-def delete_recurring_template(template_id: str) -> None:
-    records = [r for r in _load_recurring() if r["id"] != template_id]
-    _save_recurring(records)
-
-
-# ---------------------------------------------------- Document numbering --
-def _load_counters() -> dict:
-    if not COUNTERS_PATH.exists():
-        return {}
-    return json.loads(COUNTERS_PATH.read_text(encoding="utf-8"))
-
-
-def _save_counters(counters: dict) -> None:
-    _ensure_dirs()
-    COUNTERS_PATH.write_text(json.dumps(counters, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def peek_next_number(doc_type: str) -> int:
-    """Return the sequence number that would be suggested next, without consuming it."""
-    return _load_counters().get(doc_type, 0) + 1
-
-
-def consume_next_number(doc_type: str) -> int:
-    """Advance and persist the counter for doc_type; return the number just consumed."""
-    counters = _load_counters()
-    next_n = counters.get(doc_type, 0) + 1
-    counters[doc_type] = next_n
-    _save_counters(counters)
-    return next_n
 
 
 # ------------------------------------------------------- Restore from ZIP --
 def import_zip(zip_bytes: bytes, overwrite_profile: bool = False) -> dict:
-    """Restore data from a ZIP produced by export_all_zip().
-
-    Existing local data is never deleted. Records are merged by id — only
-    entries not already present locally are added. The profile is only
-    overwritten if `overwrite_profile` is True or no local profile exists.
-    Returns a summary of how many items were imported per category.
+    """Restore data from a ZIP produced by export_all_zip() (this version or the
+    earlier local-file version). Existing data is never deleted — only records
+    not already present (by id) are added. The profile is only overwritten if
+    `overwrite_profile` is True or nothing is saved yet.
     """
-    _ensure_dirs()
+    client = _get_client()
     summary = {"documents": 0, "clients": 0, "item_templates": 0, "recurring_templates": 0, "profile_applied": False}
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -283,54 +356,82 @@ def import_zip(zip_bytes: bytes, overwrite_profile: bool = False) -> dict:
         # --- history + PDFs ---
         imported_history = read_json("history.json") or []
         if imported_history:
-            existing = _load_history_index()
-            existing_ids = {r["id"] for r in existing}
+            existing_ids = {r["id"] for r in list_documents()}
             for rec in imported_history:
                 rid = rec.get("id")
                 if not rid or rid in existing_ids:
                     continue
                 pdf_name = f"documents/{rid}.pdf"
+                pdf_path = None
                 if pdf_name in names:
-                    (DOCS_DIR / f"{rid}.pdf").write_bytes(zf.read(pdf_name))
-                existing.append(rec)
+                    pdf_bytes = zf.read(pdf_name)
+                    pdf_path = f"{rid}.pdf"
+                    client.storage.from_(DOCUMENTS_BUCKET).upload(
+                        pdf_path, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"},
+                    )
+                row = {
+                    "id": rid,
+                    "doc_type": rec.get("doc_type", "Invoice"),
+                    "doc_number": rec.get("doc_number", ""),
+                    "client_name": rec.get("client_name", ""),
+                    "grand_total": rec.get("grand_total", 0),
+                    "balance_due": rec.get("balance_due", 0),
+                    "currency": rec.get("currency", "₺"),
+                    "issue_date": rec.get("issue_date", ""),
+                    "due_date_iso": rec.get("due_date_iso"),
+                    "file_name": rec.get("file_name", ""),
+                    "status": rec.get("status", "unpaid"),
+                    "pdf_path": pdf_path,
+                }
+                if rec.get("created_at"):
+                    row["created_at"] = rec["created_at"]
+                client.table("documents").insert(row).execute()
                 existing_ids.add(rid)
                 summary["documents"] += 1
-            existing.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-            _save_history_index(existing)
 
         # --- id-keyed lists: clients, item templates, recurring templates ---
-        for json_name, loader, saver, key in [
-            ("clients.json", _load_clients, _save_clients, "clients"),
-            ("item_templates.json", _load_item_templates, _save_item_templates, "item_templates"),
-            ("recurring_templates.json", _load_recurring, _save_recurring, "recurring_templates"),
+        for json_name, table_name, key in [
+            ("clients.json", "clients", "clients"),
+            ("item_templates.json", "item_templates", "item_templates"),
+            ("recurring_templates.json", "recurring_templates", "recurring_templates"),
         ]:
             imported = read_json(json_name) or []
             if not imported:
                 continue
-            existing = loader()
-            existing_ids = {r["id"] for r in existing if "id" in r}
+            existing_ids = {r["id"] for r in client.table(table_name).select("id").execute().data}
             added = 0
             for rec in imported:
                 if rec.get("id") and rec["id"] not in existing_ids:
-                    existing.append(rec)
+                    client.table(table_name).insert(rec).execute()
                     existing_ids.add(rec["id"])
                     added += 1
-            if added:
-                saver(existing)
             summary[key] = added
 
         # --- profile (only if requested or nothing local yet) ---
         imported_profile = read_json("profile.json")
-        if imported_profile is not None and (overwrite_profile or not PROFILE_PATH.exists()):
-            PROFILE_PATH.write_text(json.dumps(imported_profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        if imported_profile is not None and (overwrite_profile or load_profile() is None):
+            row = {
+                "id": 1,
+                "name": imported_profile.get("name", ""),
+                "email": imported_profile.get("email", ""),
+                "address": imported_profile.get("address", ""),
+                "tax_number": imported_profile.get("tax_number", ""),
+            }
+            logo_b64 = imported_profile.get("logo_bytes_b64") or imported_profile.get("logo_b64")
+            signature_b64 = imported_profile.get("signature_bytes_b64")
+            if logo_b64:
+                row["logo_path"] = _upload_asset("profile/logo", base64.b64decode(logo_b64))
+            if signature_b64:
+                row["signature_path"] = _upload_asset("profile/signature", base64.b64decode(signature_b64))
+            client.table("profile").upsert(row).execute()
             summary["profile_applied"] = True
 
         # --- counters: never move a sequence backward ---
         imported_counters = read_json("counters.json") or {}
         if imported_counters:
-            counters = _load_counters()
+            existing_counters = {r["doc_type"]: r["value"] for r in client.table("counters").select("*").execute().data}
             for doc_type, value in imported_counters.items():
-                counters[doc_type] = max(counters.get(doc_type, 0), value)
-            _save_counters(counters)
+                new_val = max(existing_counters.get(doc_type, 0), value)
+                client.table("counters").upsert({"doc_type": doc_type, "value": new_val}).execute()
 
     return summary
