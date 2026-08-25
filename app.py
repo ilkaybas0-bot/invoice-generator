@@ -29,6 +29,52 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def _check_password() -> bool:
+    """Gate the whole app behind a shared password from st.secrets['APP_PASSWORD'].
+
+    If no password is configured (e.g. local development without secrets.toml),
+    the app is left open — the gate only activates once a password is set.
+    """
+    try:
+        expected = st.secrets["APP_PASSWORD"]
+    except Exception:
+        return True
+
+    if st.session_state.get("_authenticated"):
+        return True
+
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+    #MainMenu, footer, .stAppDeployButton { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    _, center_col, _ = st.columns([1, 1.2, 1])
+    with center_col:
+        st.markdown(
+            '<div style="text-align:center; margin-top:12vh; margin-bottom:8px; font-size:40px;">🧾</div>'
+            '<div style="text-align:center; font-weight:800; font-size:1.3rem; margin-bottom:24px;">'
+            'Invoice Generator</div>',
+            unsafe_allow_html=True,
+        )
+        with st.form("login_form"):
+            pwd = st.text_input("Password / Şifre", type="password", label_visibility="collapsed", placeholder="Password / Şifre")
+            submitted = st.form_submit_button("Giriş / Login", type="primary", use_container_width=True)
+        if submitted:
+            if pwd == expected:
+                st.session_state["_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Yanlış şifre / Wrong password")
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 # ------------------------------------------------------------------ Theme --
 st.markdown("""
 <style>
