@@ -2,6 +2,8 @@
 
 Freelancer'lar, ajanslar ve küçük işletmeler için Streamlit tabanlı, profesyonel görünümlü PDF fatura/teklif oluşturma uygulaması.
 
+Canlı: **https://invoice-generator-zzsj26rvftrtgseyttge68.streamlit.app/**
+
 ## Kurulum ve Çalıştırma
 
 ```bash
@@ -11,6 +13,16 @@ streamlit run app.py
 ```
 
 Tarayıcı otomatik olarak `http://localhost:8501` adresini açar. Durdurmak için terminalde `Ctrl+C`.
+
+### Veritabanı bağlantısı (Supabase)
+
+Uygulama tüm verileri (profil, müşteri, geçmiş, şablonlar) Supabase'de tutar — yerel dosyaya bağımlı değildir:
+
+1. [supabase.com](https://supabase.com)'da ücretsiz bir proje oluştur
+2. SQL Editor'de [`supabase_schema.sql`](supabase_schema.sql) dosyasının içeriğini çalıştır (tabloları + storage bucket izinlerini kurar)
+3. Project Settings → API'den **Project URL** ve **anon/publishable key**'i al
+4. `.streamlit/secrets.toml.example` dosyasını `.streamlit/secrets.toml` olarak kopyala, kendi değerlerini yaz (bu dosya `.gitignore`'da, asla commit edilmez)
+5. Streamlit Cloud'a deploy ederken aynı iki değeri uygulamanın **Settings → Secrets** kısmına ekle
 
 ## Özellikler
 
@@ -55,19 +67,9 @@ Tarayıcı otomatik olarak `http://localhost:8501` adresini açar. Durdurmak iç
 
 ## Veri Nerede Saklanıyor?
 
-Tüm veriler proje klasöründeki `data/` dizininde, yerel JSON dosyaları ve PDF'ler olarak tutulur:
+Supabase'de: yapılandırılmış veriler (profil, müşteriler, geçmiş, şablonlar, sayaçlar) Postgres tablolarında; oluşturulan PDF'ler ve logo/imza görselleri iki ayrı Storage bucket'ında (`documents`, `assets`) tutulur. Bu sayede Streamlit Cloud gibi dosya sisteminin kalıcı olmadığı ortamlarda bile veriler kaybolmaz.
 
-```
-data/
-├── profile.json              # Firma profili (logo/imza dahil)
-├── clients.json               # Adres defteri
-├── item_templates.json        # Ürün/hizmet şablonları
-├── recurring_templates.json   # Tekrarlayan fatura şablonları
-├── history.json                # Belge geçmişi metadatası
-└── documents/                  # Oluşturulan PDF'lerin kendisi
-```
-
-Bu klasör `.gitignore` ile versiyon kontrolünden hariç tutulmuştur — kişisel/müşteri verisi içerir, GitHub'a yüklenmez.
+Şema tanımı [`supabase_schema.sql`](supabase_schema.sql) dosyasında. Kimlik bilgileri `.streamlit/secrets.toml` içinde tutulur (gitignore'da, asla commit edilmez).
 
 ## Proje Yapısı
 
@@ -77,7 +79,7 @@ invoice-generator/
 ├── requirements.txt
 └── utils/
     ├── pdf_builder.py       # ReportLab ile PDF üretim motoru
-    ├── storage.py            # Yerel JSON tabanlı kayıt/okuma
+    ├── storage.py            # Supabase (Postgres + Storage) tabanlı kayıt/okuma
     ├── i18n.py                # Türkçe/İngilizce çeviri sözlüğü
     └── emailer.py             # SMTP e-posta gönderimi
 ```
