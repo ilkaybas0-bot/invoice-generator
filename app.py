@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import html as html_lib
+import urllib.parse
 
 import pandas as pd
 import streamlit as st
@@ -596,7 +597,7 @@ with tab_new:
                 st.success(t(lang, "pdf_success"))
                 file_name = f"{doc_type}_{doc_number}.pdf".replace(" ", "_")
 
-                storage.save_document(pdf_bytes, {
+                saved_doc_id = storage.save_document(pdf_bytes, {
                     "doc_type": doc_type,
                     "doc_number": doc_number,
                     "client_name": client_name.strip(),
@@ -628,6 +629,9 @@ with tab_new:
                     "doc_type": doc_type,
                     "doc_number": doc_number,
                     "sender_name": sender_name.strip(),
+                    "doc_id": saved_doc_id,
+                    "grand_total": round(data.grand_total, 2),
+                    "currency": currency,
                 }
 
                 st.download_button(
@@ -676,6 +680,35 @@ with tab_new:
                         st.error(t(lang, "email_fail", error=exc))
                     else:
                         st.success(t(lang, "email_success", to=email_to.strip()))
+
+    # ---------------------------------------------------------- WhatsApp --
+    with st.expander(t(lang, "whatsapp_section")):
+        if not st.session_state.last_pdf:
+            st.caption(t(lang, "email_no_pdf"))
+        else:
+            last = st.session_state.last_pdf
+            wa_phone = st.text_input(t(lang, "whatsapp_phone"), placeholder="905551234567", help=t(lang, "whatsapp_phone_help"))
+            try:
+                pdf_url = storage.get_document_url(last["doc_id"])
+            except Exception:
+                pdf_url = None
+
+            if not pdf_url:
+                st.caption(t(lang, "whatsapp_no_url"))
+            else:
+                default_wa_message = t(
+                    lang, "whatsapp_default_message",
+                    client=last["client_name"] or "-", doc_type=last["doc_type"], doc_number=last["doc_number"],
+                    total=format_money(last["grand_total"], last["currency"], lang),
+                    sender=last["sender_name"], url=pdf_url,
+                )
+                wa_message = st.text_area(t(lang, "whatsapp_message"), value=default_wa_message, height=140)
+
+                digits = "".join(ch for ch in wa_phone if ch.isdigit())
+                wa_base = f"https://wa.me/{digits}" if digits else "https://wa.me/"
+                wa_link = f"{wa_base}?text={urllib.parse.quote(wa_message)}"
+                st.link_button(t(lang, "whatsapp_send"), wa_link, type="primary", use_container_width=True)
+                st.caption(t(lang, "whatsapp_help"))
 
 # ======================================================= TAB: DASHBOARD ===
 with tab_dashboard:

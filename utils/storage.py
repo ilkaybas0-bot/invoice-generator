@@ -177,6 +177,11 @@ def read_document(doc_id: str) -> bytes | None:
         return None
 
 
+def get_document_url(doc_id: str) -> str:
+    """Return the public Storage URL for a generated PDF (bucket is public)."""
+    return _get_client().storage.from_(DOCUMENTS_BUCKET).get_public_url(f"{doc_id}.pdf")
+
+
 def delete_document(doc_id: str) -> None:
     client = _get_client()
     client.table("documents").delete().eq("id", doc_id).execute()
