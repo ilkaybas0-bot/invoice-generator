@@ -170,23 +170,40 @@ def list_documents() -> list[dict]:
     return records
 
 
+def _resolve_pdf_path(doc_id: str) -> str:
+    """Look up the actual Storage path for a document.
+
+    The path is read from the row's `pdf_path` column rather than rebuilt as
+    `f"{doc_id}.pdf"`, because Postgres normalizes uuid-typed id columns
+    (dashes get added/reformatted) — a mismatch between the id we generated
+    client-side and the id Postgres hands back would otherwise silently break
+    downloads, sharing links, and storage cleanup. Falls back to the naive
+    path for rows saved before `pdf_path` existed.
+    """
+    res = _get_client().table("documents").select("pdf_path").eq("id", doc_id).limit(1).execute()
+    if res.data and res.data[0].get("pdf_path"):
+        return res.data[0]["pdf_path"]
+    return f"{doc_id}.pdf"
+
+
 def read_document(doc_id: str) -> bytes | None:
     try:
-        return _get_client().storage.from_(DOCUMENTS_BUCKET).download(f"{doc_id}.pdf")
+        return _get_client().storage.from_(DOCUMENTS_BUCKET).download(_resolve_pdf_path(doc_id))
     except Exception:
         return None
 
 
 def get_document_url(doc_id: str) -> str:
     """Return the public Storage URL for a generated PDF (bucket is public)."""
-    return _get_client().storage.from_(DOCUMENTS_BUCKET).get_public_url(f"{doc_id}.pdf")
+    return _get_client().storage.from_(DOCUMENTS_BUCKET).get_public_url(_resolve_pdf_path(doc_id))
 
 
 def delete_document(doc_id: str) -> None:
     client = _get_client()
+    path = _resolve_pdf_path(doc_id)
     client.table("documents").delete().eq("id", doc_id).execute()
     try:
-        client.storage.from_(DOCUMENTS_BUCKET).remove([f"{doc_id}.pdf"])
+        client.storage.from_(DOCUMENTS_BUCKET).remove([path])
     except Exception:
         pass
 
